@@ -32,6 +32,7 @@ struct item {
 	char *text;
 	struct item *left, *right;
 	int out;
+	int distance;
 };
 
 static char text[BUFSIZ] = "";
@@ -87,6 +88,15 @@ calcoffsets(void)
 	for (i = 0, prev = curr; prev && prev->left; prev = prev->left)
 		if ((i += (lines > 0) ? bh : MIN(TEXTW(prev->left->text), n)) > n)
 			break;
+}
+
+static int
+max_textw(void)
+{
+	int len = 0;
+	for (struct item *item = items; item && item->text; item++)
+		len = MAX(TEXTW(item->text), len);
+	return len;
 }
 
 static void
@@ -264,6 +274,84 @@ match(void)
 	calcoffsets();
 }
 
+static int
+compare_distance(const void *a, const void *b)
+{
+	struct item const *da = *(struct item **) a;
+	struct item const *db = *(struct item **) b;
+
+	if (!db)
+		return 1;
+	if (!da)
+		return -1;
+	return da->distance - db->distance;
+}
+
+static void
+fuzzymatch(void)
+{
+	struct item *item;
+	struct item **fuzzymatches = NULL;
+	char c;
+	int number_of_matches = 0, i, pidx, sidx, eidx;
+	int text_len = strlen(text), itext_len;
+
+	matches = matchend = NULL;
+
+	/* walk through all items */
+	for (item = items; item && item->text; item++) {
+		if (text_len) {
+			itext_len = strlen(item->text);
+			pidx = 0;
+			sidx = eidx = -1;
+			/* walk through item text */
+			for (i = 0; i < itext_len && (c = item->text[i]); i++) {
+				/* fuzzy match pattern */
+				if (text[pidx] == c) {
+					if (sidx == -1)
+						sidx = i;
+					pidx++;
+					if (pidx == text_len) {
+						eidx = i;
+						break;
+					}
+				}
+			}
+			/* build list of matches */
+			if (eidx != -1) {
+				/* compute distance */
+				/* factor in 30% of sidx and distance between eidx and total
+				 * text length .. let's see how it works */
+				item->distance = eidx - sidx + (itext_len - eidx + sidx) / 3;
+				appenditem(item, &matches, &matchend);
+				number_of_matches++;
+			}
+		}
+		else
+			appenditem(item, &matches, &matchend);
+	}
+
+	if (number_of_matches) {
+		/* initialize array with matches */
+		if (!(fuzzymatches = realloc(fuzzymatches, number_of_matches * sizeof(struct item*))))
+			die("cannot realloc %u bytes:", number_of_matches * sizeof(struct item *));
+		for (i = 0, item = matches; item && i < number_of_matches; i++, item = item->right)
+			fuzzymatches[i] = item;
+
+		/* sort matches according to distance */
+		qsort(fuzzymatches, number_of_matches, sizeof(struct item *), compare_distance);
+		/* rebuild list of matches */
+		matches = matchend = NULL;
+		for (i = 0, item = fuzzymatches[0]; i < number_of_matches && item && \
+				item->text; item = fuzzymatches[i], i++)
+			appenditem(item, &matches, &matchend);
+
+		free(fuzzymatches);
+	}
+	curr = sel = matches;
+	calcoffsets();
+}
+
 static void
 insert(const char *str, ssize_t n)
 {
@@ -274,7 +362,7 @@ insert(const char *str, ssize_t n)
 	if (n > 0)
 		memcpy(&text[cursor], str, n);
 	cursor += n;
-	match();
+	fuzzymatch();
 }
 
 static size_t
@@ -343,7 +431,7 @@ keypress(XKeyEvent *ev)
 
 		case XK_k: /* delete right */
 			text[cursor] = '\0';
-			match();
+			fuzzymatch();
 			break;
 		case XK_u: /* delete left */
 			insert(NULL, 0 - cursor);
@@ -492,7 +580,7 @@ insert:
 		strncpy(text, sel->text, sizeof text - 1);
 		text[sizeof text - 1] = '\0';
 		cursor = strlen(text);
-		match();
+		fuzzymatch();
 		break;
 	}
 
@@ -611,6 +699,7 @@ setup(void)
 	bh = drw->fonts->h + 2;
 	lines = MAX(lines, 0);
 	mh = (lines + 1) * bh;
+	promptw = (prompt && *prompt) ? TEXTW(prompt) - lrpad / 4 : 0;
 #ifdef XINERAMA
 	i = 0;
 	if (parentwin == root && (info = XineramaQueryScreens(dpy, &n))) {
@@ -637,9 +726,9 @@ setup(void)
 				if (INTERSECT(x, y, 1, 1, info[i]))
 					break;
 
-		x = info[i].x_org;
-		y = info[i].y_org + (topbar ? 0 : info[i].height - mh);
-		mw = info[i].width;
+		mw = MIN(MAX(max_textw() + promptw, 100), info[i].width);
+		x = info[i].x_org + ((info[i].width  - mw) / 2);
+		y = info[i].y_org + ((info[i].height - mh) / 2);
 		XFree(info);
 	} else
 #endif
@@ -647,21 +736,21 @@ setup(void)
 		if (!XGetWindowAttributes(dpy, parentwin, &wa))
 			die("could not get embedding window attributes: 0x%lx",
 			    parentwin);
-		x = 0;
-		y = topbar ? 0 : wa.height - mh;
-		mw = wa.width;
+		mw = MIN(MAX(max_textw() + promptw, 100), wa.width);
+		x = (wa.width  - mw) / 2;
+		y = (wa.height - mh) / 2;
 	}
-	promptw = (prompt && *prompt) ? TEXTW(prompt) - lrpad / 4 : 0;
 	inputw = MIN(inputw, mw/3);
-	match();
+	fuzzymatch();
 
 	/* create menu window */
 	swa.override_redirect = True;
 	swa.background_pixel = scheme[SchemeNorm][ColBg].pixel;
 	swa.event_mask = ExposureMask | KeyPressMask | VisibilityChangeMask;
-	win = XCreateWindow(dpy, parentwin, x, y, mw, mh, 0,
+	win = XCreateWindow(dpy, parentwin, x, y, mw, mh, border_width,
 	                    CopyFromParent, CopyFromParent, CopyFromParent,
 	                    CWOverrideRedirect | CWBackPixel | CWEventMask, &swa);
+	XSetWindowBorder(dpy, win, scheme[SchemeSel][ColBg].pixel);
 	XSetClassHint(dpy, win, &ch);
 
 
